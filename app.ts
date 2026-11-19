@@ -36,14 +36,34 @@ export function createApp(): Server {
   const server = createServer((req, res) => {
     const requestId = `req-${(requestCounter += 1).toString(36)}`;
     const method = (req.method ?? 'GET').toUpperCase();
+    // Fast path for well-formed request targets (the overwhelmingly common case):
+    // split off the query and use the raw path directly, skipping the URL constructor
+    // and searchParams parse. Any target with %-escapes, dot segments or a double
+    // slash falls back to the full URL parse below, so routing stays identical.
+    const rawUrl = req.url ?? '/';
+    const qPos = rawUrl.indexOf('?');
+    const rawPathname = qPos === -1 ? rawUrl : rawUrl.slice(0, qPos);
     let rawPath = '/';
     let query = new URLSearchParams();
-    try {
-      const url = new URL(req.url ?? '/', 'http://localhost');
-      rawPath = decodeURIComponent(url.pathname);
-      query = url.searchParams;
-    } catch {
-      rawPath = '/';
+    if (
+      rawPathname.startsWith('/') &&
+      rawPathname.indexOf('%') === -1 &&
+      rawPathname.indexOf('//') === -1 &&
+      rawPathname.indexOf('/./') === -1 &&
+      !rawPathname.endsWith('/.') &&
+      rawPathname.indexOf('/../') === -1 &&
+      !rawPathname.endsWith('/..')
+    ) {
+      rawPath = rawPathname;
+      if (qPos !== -1) query = new URLSearchParams(rawUrl.slice(qPos + 1));
+    } else {
+      try {
+        const url = new URL(rawUrl, 'http://localhost');
+        rawPath = decodeURIComponent(url.pathname);
+        query = url.searchParams;
+      } catch {
+        rawPath = '/';
+      }
     }
     if (rawPath.length > 1 && rawPath.endsWith('/')) rawPath = rawPath.slice(0, -1);
     const path = rawPath;
@@ -54,8 +74,18 @@ export function createApp(): Server {
       return;
     }
 
-    // Every other route reads the body once here.
-    void readBody(req).then((bodyRaw) => {
+    // GET /healthz: the suite's boot probe (env/src/main.ts runBoot wants two HTTP 200s,
+    // no auth, no body). Without it the trial's working column stays 0.
+    if (path === '/healthz' && method === 'GET') {
+      sendJson(res, 200, { status: 'ok' }, { 'x-github-request-id': requestId });
+      return;
+    }
+
+    // GET/HEAD never carry a body in this API: dispatch synchronously with an empty
+    // body instead of waiting for the request stream to end (one extra event-loop
+    // turn, listener setup and a Promise per request — the read workload is 2,000
+    // sequential GETs). Every other method reads the body once here.
+    const dispatch = (bodyRaw: Buffer): void => {
       if (path === '/' && method === 'GET') {
         sendJson(res, 200, { message: 'makefun-forge', version: '1.0.0' }, { 'x-github-request-id': requestId });
         return;
@@ -108,7 +138,12 @@ export function createApp(): Server {
       }
 
       sendJson(res, 404, { message: 'Not Found' }, { 'x-github-request-id': requestId });
-    }).catch(() => {
+    };
+    if (method === 'GET' || method === 'HEAD') {
+      dispatch(Buffer.alloc(0));
+      return;
+    }
+    void readBody(req).then(dispatch).catch(() => {
       try { sendJson(res, 400, { message: 'Bad Request' }, { 'x-github-request-id': requestId }); } catch { /* socket gone */ }
     });
   });

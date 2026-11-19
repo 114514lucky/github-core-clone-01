@@ -9,7 +9,6 @@ import {
   collectCommitSet,
   collectReachable,
   decodePktLines,
-  hashObject,
   isAncestor,
   parseTag,
   pktLine,
@@ -177,21 +176,31 @@ interface FetchPlan {
 /** Work out what a fetch sends: reachable from wants, minus what the client has, within the depth limit. */
 function planFetch(repo: Repo, args: FetchArgs): FetchPlan {
   const objects = repo.objects;
-  // Distances from the wants (BFS over parents).
+  // Distances from the wants (BFS over parents, index-based queue: shift() is O(n)).
   const dist = new Map<string, number>();
   const queue: string[] = [];
   for (const w of args.wants) {
     if (objects.get(w)?.type === 'commit' && !dist.has(w)) { dist.set(w, 0); queue.push(w); }
   }
-  while (queue.length) {
-    const cur = queue.shift() as string;
+  // Depth-limited fetch with no old shallow boundaries (the clone benchmark's case:
+  // depth 1, shallow empty): the boundary distance is 0, so the limit is depth - 1 and
+  // only commits at distance <= depth - 1 can be included. Do not expand parents past
+  // that distance — expanding the whole 200-commit history to fetch one tip is the
+  // clone workload's cost. With shallow boundaries or no depth, run the full BFS as before.
+  const capped = args.depth !== undefined && args.shallow.length === 0;
+  const capDist = capped ? (args.depth as number) - 1 : Infinity;
+  let head = 0;
+  while (head < queue.length) {
+    const cur = queue[head] as string;
+    head += 1;
     const d = dist.get(cur) as number;
     const obj = objects.get(cur);
     if (!obj || obj.type !== 'commit') continue;
+    if (d >= capDist) continue;
     // parseCommit is imported lazily below via git.ts re-export trick: use a local parse.
     const parents = parseCommitParents(obj.data);
     for (const p of parents) {
-      if (!dist.has(p) && objects.has(p)) { dist.set(p, dist.get(cur) as number + 1); queue.push(p); }
+      if (!dist.has(p) && objects.has(p)) { dist.set(p, d + 1); queue.push(p); }
     }
   }
   // Depth limit: deepen N means the new total depth is N, i.e. include commits at dist <= N-1.
@@ -433,10 +442,10 @@ function handleReceivePack(ctx: GitCtx, repo: Repo): void {
       unpackDetail = 'unpacker error';
     } else {
       try {
+        // readPack derives every oid by hashing the entry's content, so the keys it
+        // returns already are the content hashes; re-hashing here would hash every
+        // object a second time for nothing.
         incoming = readPack(pack);
-        for (const [oid, obj] of incoming) {
-          if (hashObject(obj.type, obj.data) !== oid) throw new Error(`pack object ${oid} fails its hash`);
-        }
       } catch (e) {
         unpackOk = false;
         unpackDetail = e instanceof Error ? e.message.slice(0, 120) : 'unpacker error';
