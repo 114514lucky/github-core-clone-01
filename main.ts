@@ -23,18 +23,78 @@ if (ENV_URL === '') {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
   process.exit(1);
 }
+if (!/^https?:\/\/[^/]+/.test(ENV_URL)) {
+  process.stderr.write('[entry] MAKEFUN_ENV_URL must be an http(s) origin\n');
+  process.exit(1);
+}
 
-/** How long one register or done request may take before it is abandoned and retried. */
-const REQUEST_TIMEOUT_MS = 30_000;
-/** The first wait between retries, and the longest. */
-const RETRY_INITIAL_MS = 250;
-const RETRY_MAX_MS = 2_000;
+/** Read an entry tuning value from the environment, clamping it into its safe range. */
+function entryEnvInt(name: string, fallback: number, low: number, high: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed < low) return low;
+  if (parsed > high) return high;
+  return parsed;
+}
+
+/** One request may take this long before it is abandoned and retried; tunable, defaults as before. */
+const REQUEST_TIMEOUT_MS = entryEnvInt('GCC_ENTRY_REQUEST_TIMEOUT_MS', 30_000, 1_000, 120_000);
+/** First wait between retries, and the longest wait; tunable, defaults as before. */
+const RETRY_INITIAL_MS = entryEnvInt('GCC_ENTRY_RETRY_INITIAL_MS', 250, 50, 5_000);
+const RETRY_MAX_MS = entryEnvInt('GCC_ENTRY_RETRY_MAX_MS', 2_000, 250, 30_000);
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
 function retryDelay(attempt: number): number {
   return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
+}
+
+/** Counters for the final summary line: how many tries each phase needed. */
+let entryRegisterTries = 0;
+let entryDoneTries = 0;
+
+/** Note progress on stderr, but at most once every 25 tries so a slow env never spams the log. */
+function logRetry(phase: string, attempt: number): void {
+  if (attempt > 0 && attempt % 25 === 0) {
+    process.stderr.write(`[entry] ${phase} still waiting after ${attempt} tries\n`);
+  }
+}
+
+/** Fail fast when the tuned entry values contradict each other; defaults always pass. */
+function assertEntryConfig(): void {
+  if (RETRY_INITIAL_MS > RETRY_MAX_MS) throw new Error('retry initial wait exceeds retry max wait');
+  if (REQUEST_TIMEOUT_MS < 1000) throw new Error('request timeout below 1000ms');
+  if (RETRY_MAX_MS > 30_000) throw new Error('retry max wait above 30000ms');
+}
+
+/** One line describing the effective entry configuration, for the startup log. */
+function entryConfigSummary(): string {
+  return `origin=${describeOrigin(ENV_URL)} request-timeout=${REQUEST_TIMEOUT_MS}ms retry=${RETRY_INITIAL_MS}..${RETRY_MAX_MS}ms`;
+}
+
+/** The host part of an env origin, for the startup line: scheme and path stripped off. */
+function describeOrigin(url: string): string {
+  const rest = url.replace(/^https?:\/\//, '');
+  const host = rest.split('/')[0];
+  return host;
+}
+
+/** Wait until our own server answers GET /healthz, so register never races a half-started server. */
+async function waitForLocalServer(port: number): Promise<void> {
+  const target = `http://127.0.0.1:${port}/healthz`;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const res = await fetch(target, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      if (res.ok) return;
+      logRetry('local-server', attempt);
+    } catch {
+      logRetry('local-server', attempt);
+    }
+    await sleep(retryDelay(attempt));
+  }
 }
 
 /**
@@ -51,11 +111,17 @@ async function register(port: number): Promise<void> {
         body: JSON.stringify({ port }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      if (res.status === 200 || res.status === 409) return;
+      if (res.status === 200) return;
+      if (res.status === 409) {
+        process.stderr.write('[entry] register answered 409: another entry registered first; waiting\n');
+        return;
+      }
       if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
     }
+    entryRegisterTries = attempt + 1;
+    logRetry('register', attempt);
     await sleep(retryDelay(attempt));
   }
 }
@@ -72,12 +138,15 @@ async function waitForDone(): Promise<void> {
     } catch {
       // The env is not answering yet, or the poll timed out: it is not done, so poll again.
     }
+    entryDoneTries = attempt + 1;
+    logRetry('done', attempt);
     await sleep(retryDelay(attempt));
   }
 }
 
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
+  assertEntryConfig();
   const server = createApp();
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -85,14 +154,18 @@ async function main(): Promise<void> {
   });
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
+  if (address.port === 8080) throw new Error('the server bound the env port 8080 instead of an ephemeral port');
   process.stdout.write(`[entry] listening on port ${address.port}\n`);
+  process.stderr.write(`[entry] config ${entryConfigSummary()}\n`);
 
+  await waitForLocalServer(address.port);
   await register(address.port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
   server.close();
   process.stdout.write('[entry] done\n');
+  process.stderr.write(`[entry] summary register-tries=${entryRegisterTries} done-tries=${entryDoneTries}\n`);
 }
 
 try {
